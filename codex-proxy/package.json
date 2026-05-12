@@ -1,0 +1,16 @@
+{
+  "name": "codex-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun run bin/build.ts",
+    "start": "bun run bin/proxy.ts",
+    "dev": "bun --watch run bin/proxy.ts",
+    "peek": "bun run bin/peek.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "hono": "^4.11.4"
+  }
+}
