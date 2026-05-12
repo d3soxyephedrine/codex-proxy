@@ -1,0 +1,15 @@
+[project]
+name = "strict-experimental-enforcer-agent"
+version = "0.1.0"
+description = "OpenAI Agents SDK prototype for strict + experimental-mode response calibration."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "openai-agents>=0.2.0",
+  "fastapi>=0.115.0",
+  "uvicorn>=0.30.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

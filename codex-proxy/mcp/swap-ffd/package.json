@@ -1,0 +1,14 @@
+{
+    "name": "swap-ffd-mcp",
+    "version": "1.0.0",
+    "private": true,
+    "type": "module",
+    "description": "MCP stdio server wrapping the FFD attack suite. Exposes tools to run probes, list probes, and get results.",
+    "scripts": {
+        "start": "bun run server.ts",
+        "cli": "bun run run-ffd-attack-suite.ts"
+    },
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.0.4"
+    }
+}

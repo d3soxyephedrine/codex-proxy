@@ -1,0 +1,15 @@
+{
+  "name": "session-context-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local MCP stdio server that exposes load_session_context() — returns the active skill stack manifest as a JSON tool output. Used by Cline-family extensions (Roo, Cline, rx-cline, Cline Max) to load skills via tool-output channel instead of system-prompt channel.",
+  "scripts": {
+    "start": "bun run server.ts",
+    "render": "bun run server.ts --render",
+    "render-pretty": "bun run server.ts --render --pretty"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  }
+}
