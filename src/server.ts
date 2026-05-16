@@ -257,17 +257,16 @@ function buildHeaders(
   accessToken: string,
   accountId: string | null,
   sessionId: string | null,
+  authMode: string | null,
 ): Headers {
   const headers = new Headers(source);
+  const apiKeyMode = (authMode || "").toLowerCase() === "apikey";
 
   for (const header of [
     "authorization",
     "content-encoding",
     "content-length",
     "host",
-    "openai-beta",
-    "openai-organization",
-    "openai-project",
     "x-api-key",
     "api-key",
   ]) {
@@ -275,6 +274,26 @@ function buildHeaders(
   }
 
   headers.set("authorization", `Bearer ${accessToken}`);
+
+  if (apiKeyMode) {
+    headers.delete("chatgpt-account-id");
+    headers.delete("session_id");
+    headers.delete("origin");
+    headers.delete("referer");
+    headers.delete("oai-language");
+    headers.delete("sec-fetch-dest");
+    headers.delete("sec-fetch-mode");
+    headers.delete("sec-fetch-site");
+    if (!headers.has("user-agent")) {
+      headers.set("user-agent", "codex-proxy/0.1.0");
+    }
+    return headers;
+  }
+
+  for (const header of ["openai-beta", "openai-organization", "openai-project"]) {
+    headers.delete(header);
+  }
+
   headers.set("origin", CHATGPT_ORIGIN);
   headers.set("referer", `${CHATGPT_ORIGIN}/`);
   headers.set("accept-language", "en-US,en;q=0.9");
@@ -1409,6 +1428,7 @@ app.all("*", async (c) => {
       auth.accessToken,
       auth.accountId,
       prepared.sessionId,
+      auth.authMode,
     );
     const upstreamUrl = buildUpstreamUrl(c.req.url, prepared.sessionId);
     const upstreamParsedUrl = new URL(upstreamUrl);

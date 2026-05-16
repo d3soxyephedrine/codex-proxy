@@ -1,121 +1,280 @@
 import { readFile, writeFile } from "fs/promises";
-import { access } from "fs/promises";
 import { homedir } from "os";
-import { join, dirname } from "path";
+import { join } from "path";
 
-async function resolveAuthPath(): Promise<string> {
-  if (process.env.CLAUDE_PROXY_AUTH_PATH) return process.env.CLAUDE_PROXY_AUTH_PATH;
-  const primary = join(homedir(), ".local/share/opencode/auth.json");
-  try { await access(primary); return primary; } catch {}
-  // Fallback: .auth.json next to the proxy repo (Replit persistent storage)
-  const local = join(dirname(import.meta.dir), ".auth.json");
-  try { await access(local); return local; } catch {}
-  return primary; // will fail with clear ENOENT
-}
-
-let AUTH_PATH: string;
-const REFRESH_URL = "https://console.anthropic.com/v1/oauth/token";
-const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const AUTH_PATH = process.env.CODEX_PROXY_AUTH_FILE || join(homedir(), ".codex", "auth.json");
+const TOKEN_URL = "https://auth.openai.com/oauth/token";
+const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const EXPIRY_BUFFER_MS = 60_000;
 
-// Direct token injection — no file needed.
-// CLAUDE_PROXY_OAUTH_TOKEN: access token (required)
-// CLAUDE_PROXY_OAUTH_REFRESH: refresh token (optional, enables auto-refresh)
-const ENV_TOKEN = process.env.CLAUDE_PROXY_OAUTH_TOKEN;
-const ENV_REFRESH = process.env.CLAUDE_PROXY_OAUTH_REFRESH;
+interface AuthTokens {
+  access_token?: string;
+  refresh_token?: string;
+  expires_at?: number | null;
+  account_id?: string;
+  organization_id?: string;
+  org_id?: string;
+  openai_organization?: string;
+  id_token?: string;
+  [key: string]: unknown;
+}
 
-interface AuthData {
-  anthropic: {
-    type: string;
-    access: string;
-    refresh: string;
-    expires: number;
+interface AuthFile {
+  auth_mode?: string;
+  account_id?: string;
+  organization_id?: string;
+  org_id?: string;
+  openai_organization?: string;
+  last_refresh?: string;
+  tokens?: AuthTokens;
+  OPENAI_API_KEY?: string;
+  [key: string]: unknown;
+}
+
+interface RefreshResponse {
+  access_token?: string;
+  refresh_token?: string;
+  expires_in?: number;
+  expires_at?: number;
+  account_id?: string;
+  id_token?: string;
+}
+
+interface JwtAuthClaim {
+  chatgpt_account_id?: string;
+  organization_id?: string;
+  allowed_workspace_id?: string;
+  [key: string]: unknown;
+}
+
+export interface AuthState {
+  accessToken: string;
+  refreshToken: string;
+  accountId: string | null;
+  organizationId: string | null;
+  expiresAt: number;
+  authMode: string | null;
+  scopes: string[];
+}
+
+let cached: AuthState | null = null;
+let refreshing: Promise<AuthState> | null = null;
+
+function coerceEpochMs(value: number | null | undefined): number {
+  if (!value || !Number.isFinite(value)) return 0;
+  return value > 1_000_000_000_000 ? value : value * 1000;
+}
+
+function decodeJwtPayload(token: string | null | undefined): Record<string, unknown> | null {
+  if (!token) return null;
+
+  const [, payload] = token.split(".");
+  if (!payload) return null;
+
+  const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized.padEnd(normalized.length + ((4 - normalized.length % 4) % 4), "=");
+
+  try {
+    return JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function extractClaimObject(payload: Record<string, unknown> | null): JwtAuthClaim | null {
+  const claim = payload?.["https://api.openai.com/auth"];
+  return claim && typeof claim === "object" ? claim as JwtAuthClaim : null;
+}
+
+function extractScopes(payload: Record<string, unknown> | null): string[] {
+  const scopes = payload?.scp;
+  return Array.isArray(scopes) ? scopes.filter((scope): scope is string => typeof scope === "string") : [];
+}
+
+function deriveExpiryMs(token: string | null | undefined, explicitExpiry: number | null | undefined): number {
+  const fromFile = coerceEpochMs(explicitExpiry);
+  if (fromFile > 0) return fromFile;
+
+  const payload = decodeJwtPayload(token);
+  const jwtExp = typeof payload?.exp === "number" ? payload.exp : 0;
+  return coerceEpochMs(jwtExp);
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function toAuthState(data: AuthFile): AuthState {
+  const apiKey = readString(data.OPENAI_API_KEY) || readString(process.env.OPENAI_API_KEY);
+  const authModeRaw = readString(data.auth_mode);
+  const isApiKeyMode = apiKey && (!authModeRaw || authModeRaw.toLowerCase() === "apikey");
+  if (isApiKeyMode) {
+    return {
+      accessToken: apiKey!,
+      refreshToken: "",
+      accountId: readString(data.account_id),
+      organizationId: readString(data.organization_id)
+        || readString(data.org_id)
+        || readString(data.openai_organization),
+      expiresAt: Number.MAX_SAFE_INTEGER,
+      authMode: authModeRaw || "apikey",
+      scopes: [],
+    };
+  }
+
+  const accessToken = readString(data.tokens?.access_token);
+  if (!accessToken) {
+    throw new Error(`Missing access token in ${AUTH_PATH}`);
+  }
+
+  const payload = decodeJwtPayload(accessToken);
+  const claim = extractClaimObject(payload);
+  const accountId = readString(data.tokens?.account_id)
+    || readString(data.account_id)
+    || readString(claim?.chatgpt_account_id);
+  const organizationId = readString(data.tokens?.organization_id)
+    || readString(data.tokens?.org_id)
+    || readString(data.tokens?.openai_organization)
+    || readString(data.organization_id)
+    || readString(data.org_id)
+    || readString(data.openai_organization)
+    || readString(claim?.organization_id)
+    || readString(claim?.allowed_workspace_id);
+
+  return {
+    accessToken,
+    refreshToken: readString(data.tokens?.refresh_token) || "",
+    accountId,
+    organizationId,
+    expiresAt: deriveExpiryMs(accessToken, data.tokens?.expires_at),
+    authMode: readString(data.auth_mode),
+    scopes: extractScopes(payload),
   };
 }
 
-let cached: AuthData | null = null;
-let refreshing: Promise<string> | null = null;
-
-async function readAuth(): Promise<AuthData> {
-  if (ENV_TOKEN) {
-    console.log("[auth] Using token from CLAUDE_PROXY_OAUTH_TOKEN env var");
-    return {
-      anthropic: {
-        type: "oauth",
-        access: ENV_TOKEN,
-        refresh: ENV_REFRESH || "",
-        expires: ENV_REFRESH ? Date.now() + 3600_000 : Infinity,
-      },
-    };
-  }
-  if (!AUTH_PATH) {
-    AUTH_PATH = await resolveAuthPath();
-    console.log("[auth] Using auth file:", AUTH_PATH);
-  }
-  const raw = await readFile(AUTH_PATH, "utf-8");
-  return JSON.parse(raw);
+async function readAuthFile(): Promise<AuthFile> {
+  const raw = await readFile(AUTH_PATH, "utf8");
+  return JSON.parse(raw) as AuthFile;
 }
 
-async function writeAuth(data: AuthData): Promise<void> {
-  if (ENV_TOKEN) return;
-  if (!AUTH_PATH) AUTH_PATH = await resolveAuthPath();
-  await writeFile(AUTH_PATH, JSON.stringify(data, null, 2) + "\n");
+function isFresh(expiresAt: number): boolean {
+  return expiresAt > 0 && Date.now() < expiresAt - EXPIRY_BUFFER_MS;
 }
 
-async function refreshToken(auth: AuthData): Promise<string> {
-  if (!auth.anthropic.refresh) {
-    throw new Error("No refresh token available — set CLAUDE_PROXY_OAUTH_REFRESH or provide auth.json");
+async function loadStoredState(): Promise<AuthState> {
+  return toAuthState(await readAuthFile());
+}
+
+async function persistAuthFile(base: AuthFile, refresh: RefreshResponse, previous: AuthState): Promise<AuthState> {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const expiresAtSeconds = typeof refresh.expires_at === "number"
+    ? Math.floor(refresh.expires_at)
+    : typeof refresh.expires_in === "number"
+      ? nowSeconds + refresh.expires_in
+      : 0;
+
+  const next: AuthFile = {
+    ...base,
+    last_refresh: new Date().toISOString(),
+    tokens: {
+      ...(base.tokens || {}),
+      access_token: refresh.access_token || previous.accessToken,
+      refresh_token: refresh.refresh_token || previous.refreshToken,
+      expires_at: expiresAtSeconds || base.tokens?.expires_at || null,
+      account_id: refresh.account_id || base.tokens?.account_id,
+      id_token: refresh.id_token || base.tokens?.id_token,
+    },
+  };
+
+  await writeFile(AUTH_PATH, JSON.stringify(next, null, 2) + "\n");
+  return toAuthState(next);
+}
+
+function formatUpstreamError(status: number, rawBody: string): string {
+  try {
+    const parsed = JSON.parse(rawBody) as Record<string, any>;
+    const error = parsed.error;
+    if (typeof error?.message === "string") {
+      return `${status}: ${error.message}`;
+    }
+  } catch {
+    // Keep the raw preview below.
   }
-  console.log("[auth] Refreshing OAuth token...");
-  const res = await fetch(REFRESH_URL, {
+
+  return `${status}: ${rawBody.slice(0, 400)}`;
+}
+
+async function refreshState(current: AuthState): Promise<AuthState> {
+  if (!current.refreshToken) {
+    throw new Error("No refresh token available");
+  }
+
+  const res = await fetch(TOKEN_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "accept": "application/json",
+    },
+    body: new URLSearchParams({
       grant_type: "refresh_token",
-      refresh_token: auth.anthropic.refresh,
+      refresh_token: current.refreshToken,
       client_id: CLIENT_ID,
     }),
+    signal: AbortSignal.timeout(10_000),
   });
 
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Token refresh failed (${res.status}): ${text}`);
+    throw new Error(`Token refresh failed (${formatUpstreamError(res.status, await res.text())})`);
   }
 
-  const data = await res.json() as {
-    access_token: string;
-    refresh_token?: string;
-    expires_in: number;
-  };
+  const refresh = await res.json() as RefreshResponse;
+  if (!refresh.access_token) {
+    throw new Error("Refresh response did not include an access token");
+  }
 
-  auth.anthropic.access = data.access_token;
-  if (data.refresh_token) auth.anthropic.refresh = data.refresh_token;
-  auth.anthropic.expires = Date.now() + data.expires_in * 1000;
-
-  await writeAuth(auth);
-  cached = auth;
-  console.log("[auth] Token refreshed, expires in", data.expires_in, "s");
-  return auth.anthropic.access;
+  const base = await readAuthFile();
+  return persistAuthFile(base, refresh, current);
 }
 
-export async function getAccessToken(): Promise<string> {
-  if (!cached) cached = await readAuth();
-
-  if (Date.now() < cached.anthropic.expires - EXPIRY_BUFFER_MS) {
-    return cached.anthropic.access;
+export async function getAuthState(): Promise<AuthState> {
+  if (!cached) {
+    cached = await loadStoredState();
   }
 
-  if (!cached.anthropic.refresh) {
-    return cached.anthropic.access; // no refresh token, use what we have
+  if (!isFresh(cached.expiresAt)) {
+    if (cached.refreshToken) {
+      if (!refreshing) {
+        refreshing = refreshState(cached)
+          .catch(async (error) => {
+            const latest = await loadStoredState();
+            if (isFresh(latest.expiresAt)) {
+              return latest;
+            }
+            throw error;
+          })
+          .finally(() => {
+            refreshing = null;
+          });
+      }
+
+      cached = await refreshing;
+    } else {
+      const latest = await loadStoredState();
+      if (isFresh(latest.expiresAt)) {
+        cached = latest;
+      } else {
+        throw new Error("OAuth token is expired and no refresh token is available");
+      }
+    }
   }
 
-  // Mutex: single concurrent refresh
-  if (!refreshing) {
-    refreshing = refreshToken(cached).finally(() => { refreshing = null; });
-  }
-  return refreshing;
+  return cached;
 }
 
-export function getTokenExpiry(): number {
-  return cached?.anthropic.expires ?? 0;
+export async function getStoredAuthInfo(): Promise<AuthState> {
+  return getAuthState();
+}
+
+export function getAuthPath(): string {
+  return AUTH_PATH;
 }
